@@ -1,0 +1,328 @@
+---
+title: "Baseline Sentiment Survey — Policy Analysis"
+author: "Nandni Talreja"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Overview
+
+This script processes baseline survey data collected across 14 battleground states.
+For each policy question it produces:
+
+1. **Weighted average allocations** broken down by gender, party, race, age group,
+   income group, and education group — both overall and by state
+2. **Distribution of opinion** (bucketed into 0–19, 20–39, 40–59, 60–79, 80–100
+   support bands) overall and by state
+3. **Demographic crosstabs** for income and education subgroups
+
+The analysis uses respondent weights throughout to correct for sample imbalances.
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(readxl)
+library(tidyverse)
+library(writexl)
+```
+
+---
+
+## 1. Load Data
+
+```{r load-data}
+# Main survey response file for the focal policy question
+# Each row = one respondent's response to one question
+df <- read_excel(here::here("data", "survey_raw_policy_a.xlsx"))
+
+# Demographic supplement: income, education, and urban/rural area
+# Linked to the main file via User ID
+otherdem <- read_excel(here::here("data", "survey_demographics.xlsx"))
+
+# Strip leading/trailing whitespace from all string columns
+df <- df %>% mutate(across(where(is.character), str_trim))
+otherdem <- otherdem %>% mutate(across(where(is.character), str_trim))
+
+# Target battleground states only
+TARGET_STATES <- c("AZ", "CA", "CO", "FL", "ME", "MI", "MO",
+                   "MS", "MT", "NE", "NV", "OH", "OR", "WA")
+
+otherdem <- otherdem %>% filter(State %in% TARGET_STATES)
+
+cat("Survey rows:", nrow(df), "\n")
+cat("Demo rows:", nrow(otherdem), "\n")
+cat("States in demo file:", n_distinct(otherdem$State), "\n")
+```
+
+---
+
+## 2. Merge Survey Responses with Demographic Data
+
+```{r merge}
+# Merge main responses with demographic supplement by respondent ID
+merged <- df %>%
+  left_join(otherdem, by = "User ID") %>%
+  mutate(user_id_matched = `User ID` %in% otherdem$`User ID`)
+
+# Merge diagnostics — useful for QC when data comes from separate exports
+n_total    <- df %>% distinct(`User ID`) %>% nrow()
+n_matched  <- df %>% inner_join(otherdem, by = "User ID") %>% distinct(`User ID`) %>% nrow()
+n_unmatched <- df %>% anti_join(otherdem, by = "User ID") %>% distinct(`User ID`) %>% nrow()
+
+cat("Total respondents in survey file:", n_total, "\n")
+cat("Matched to demographics:", n_matched, "\n")
+cat("Unmatched (survey only):", n_unmatched, "\n")
+```
+
+---
+
+## 3. Build Demographic Variables
+
+```{r demographics}
+# Reshape demographic supplement from long to wide (one row per respondent)
+transformeddem <- otherdem %>%
+  group_by(`User ID`) %>%
+  mutate(row = row_number()) %>%
+  pivot_wider(names_from = `Question Name`, values_from = `Option Text`) %>%
+  select(-row) %>%
+  rename(Area = Area) %>%   # Location urban/suburban/rural already renamed on load
+  ungroup()
+
+# Remove respondents who declined to state education (too small to analyze)
+transformeddem <- transformeddem %>%
+  filter(Education != "Prefer not to say")
+
+# Create binary income group: under vs. over $75k
+transformeddem <- transformeddem %>%
+  mutate(IncomeGroup = case_when(
+    Income %in% c("Under $25,000", "$25,000-$50,000", "$50,000-$75,000") ~ "Under $75,000",
+    Income %in% c("$75,000-$100,000", "Over $100,000")                   ~ "Over $75,000"
+  ))
+
+# Create binary education group: college vs. non-college
+transformeddem <- transformeddem %>%
+  mutate(EducationGroup = case_when(
+    Education %in% c("College graduate", "Post-graduate school", "Some college") ~ "College",
+    Education %in% c("1-11th grade", "High school graduate", "Non-college post HS") ~ "Non-college"
+  ))
+
+# Quick summary of demographic distribution
+transformeddem %>%
+  count(IncomeGroup) %>%
+  mutate(Pct = round(100 * n / sum(n), 1))
+
+transformeddem %>%
+  count(EducationGroup) %>%
+  mutate(Pct = round(100 * n / sum(n), 1))
+```
+
+---
+
+## 4. Deduplicate to One Response Per Respondent
+
+```{r deduplicate}
+# Some respondents appear multiple times (re-survey or duplicate submissions)
+# Keep only the most recent response per respondent
+df <- df %>%
+  mutate(date = mdy(`Start Date`))
+
+new_df_short <- df %>%
+  group_by(`User ID`) %>%
+  slice(which.max(as.Date(`Start Date`, "%m/%d/%Y"))) %>%
+  ungroup()
+
+# Filter to target states
+new_df_short <- new_df_short %>%
+  filter(State %in% TARGET_STATES)
+
+# Remove invalid response values (must be 0–100 on the support scale)
+new_df_short <- new_df_short %>%
+  filter(!is.na(`Response Value`) &
+         `Response Value` >= 0 &
+         `Response Value` <= 100)
+
+cat("Final deduplicated respondents:", nrow(new_df_short), "\n")
+cat("States represented:", n_distinct(new_df_short$State), "\n")
+```
+
+---
+
+## 5. Weighted Average Allocations by Demographic Group
+
+```{r weighted-averages}
+# Core function: weighted mean of response value within a subgroup
+# Uses respondent weight to correct for sample imbalance
+
+# --- Overall + Gender + Party + Race, by state ---
+combined <- new_df_short %>%
+  group_by(State) %>%
+  summarise(
+    Overall      = weighted.mean(`Response Value`, `Respondent Weight`),
+    Men          = weighted.mean(`Response Value`[Gender == "Male"],
+                                 `Respondent Weight`[Gender == "Male"],      na.rm = TRUE),
+    Women        = weighted.mean(`Response Value`[Gender == "Female"],
+                                 `Respondent Weight`[Gender == "Female"],    na.rm = TRUE),
+    Democrats    = weighted.mean(`Response Value`[Party == "Democratic Party"],
+                                 `Respondent Weight`[Party == "Democratic Party"], na.rm = TRUE),
+    Independents = weighted.mean(`Response Value`[Party == "Independent"],
+                                 `Respondent Weight`[Party == "Independent"], na.rm = TRUE),
+    Republicans  = weighted.mean(`Response Value`[Party == "Republican Party"],
+                                 `Respondent Weight`[Party == "Republican Party"], na.rm = TRUE),
+    White        = weighted.mean(`Response Value`[Race == "White"],
+                                 `Respondent Weight`[Race == "White"],        na.rm = TRUE),
+    `Black/African American` = weighted.mean(
+                   `Response Value`[Race == "African American"],
+                   `Respondent Weight`[Race == "African American"],           na.rm = TRUE),
+    `Native American` = weighted.mean(
+                   `Response Value`[Race == "Native American"],
+                   `Respondent Weight`[Race == "Native American"],            na.rm = TRUE),
+    `Latinx/Hispanic` = weighted.mean(
+                   `Response Value`[Race == "Latino / Hispanic"],
+                   `Respondent Weight`[Race == "Latino / Hispanic"],          na.rm = TRUE),
+    `Asian/AAPI` = weighted.mean(`Response Value`[Race == "Asian"],
+                                 `Respondent Weight`[Race == "Asian"],        na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- BIPOC aggregate (all non-White races combined) ---
+bipoc_races <- c("African American", "Native American",
+                 "Latino / Hispanic", "Asian", "Other")
+
+weighted_mean_bipoc <- new_df_short %>%
+  filter(Race %in% bipoc_races) %>%
+  group_by(State) %>%
+  summarise(BIPOC = weighted.mean(`Response Value`, `Respondent Weight`, na.rm = TRUE),
+            .groups = "drop")
+
+# --- Age groups ---
+age <- new_df_short %>%
+  mutate(AgeGroup = case_when(
+    Age >= 18 & Age <= 44 ~ "18-44",
+    Age >= 45 & Age <= 64 ~ "45-64",
+    Age >= 65              ~ "65+"
+  ))
+
+age_groups <- age %>%
+  group_by(AgeGroup, State) %>%
+  summarise(Avg = weighted.mean(`Response Value`, `Respondent Weight`, na.rm = TRUE),
+            .groups = "drop") %>%
+  pivot_wider(names_from = AgeGroup, values_from = Avg)
+
+# --- Combine all demographic breakouts into one table ---
+alldemos <- combined %>%
+  left_join(age_groups,          by = "State") %>%
+  left_join(weighted_mean_bipoc, by = "State")
+
+alldemos
+```
+
+---
+
+## 6. Distribution of Opinion
+
+```{r dist-of-opinion}
+# Bucket responses into 5 equal bands on the 0–100 support scale
+# These map to: Strong Oppose / Lean Oppose / Middle / Lean Support / Strong Support
+
+total_weight <- sum(new_df_short$`Respondent Weight`, na.rm = TRUE)
+
+# --- Overall distribution ---
+freq_table <- new_df_short %>%
+  mutate(Group = case_when(
+    `Response Value` >= 0  & `Response Value` <= 19  ~ "0-19",
+    `Response Value` >= 20 & `Response Value` <= 39  ~ "20-39",
+    `Response Value` >= 40 & `Response Value` <= 59  ~ "40-59",
+    `Response Value` >= 60 & `Response Value` <= 79  ~ "60-79",
+    `Response Value` >= 80 & `Response Value` <= 100 ~ "80-100"
+  )) %>%
+  group_by(Group) %>%
+  summarise(
+    Frequency = (sum(`Respondent Weight`, na.rm = TRUE) / total_weight) * 100,
+    .groups = "drop"
+  )
+
+print(freq_table)
+
+# --- Distribution by state ---
+dist_state <- data.frame(group = c("0-19", "20-39", "40-59", "60-79", "80-100"))
+
+for (st in TARGET_STATES) {
+  statewise <- new_df_short %>% filter(State == st)
+  total_weight_st <- sum(statewise$`Respondent Weight`, na.rm = TRUE)
+
+  col <- statewise %>%
+    mutate(Group = case_when(
+      `Response Value` >= 0  & `Response Value` <= 19  ~ "0-19",
+      `Response Value` >= 20 & `Response Value` <= 39  ~ "20-39",
+      `Response Value` >= 40 & `Response Value` <= 59  ~ "40-59",
+      `Response Value` >= 60 & `Response Value` <= 79  ~ "60-79",
+      `Response Value` >= 80 & `Response Value` <= 100 ~ "80-100"
+    )) %>%
+    group_by(Group) %>%
+    summarise(
+      Frequency = (sum(`Respondent Weight`, na.rm = TRUE) / total_weight_st) * 100,
+      .groups = "drop"
+    )
+
+  dist_state <- left_join(dist_state, col, by = c("group" = "Group"))
+  colnames(dist_state)[ncol(dist_state)] <- st
+}
+
+# Reshape to state rows
+state_freq_table <- dist_state %>%
+  pivot_longer(cols = -group, names_to = "State", values_to = "Frequency") %>%
+  pivot_wider(names_from = group, values_from = Frequency)
+
+state_freq_table
+```
+
+---
+
+## 7. Demographic Counts (QC)
+
+```{r demo-counts}
+# Always verify sample sizes before reporting
+# Small subgroups (n < 30) are suppressed in the report and shown as **
+
+age %>%
+  group_by(AgeGroup) %>%
+  summarise(n = n())
+
+new_df_short %>%
+  group_by(Gender) %>%
+  summarise(n = n())
+
+new_df_short %>%
+  group_by(Party) %>%
+  summarise(n = n())
+
+new_df_short %>%
+  group_by(State) %>%
+  summarise(n = n()) %>%
+  arrange(n)
+
+new_df_short %>%
+  group_by(State, Race) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(n < 30) %>%
+  arrange(State, Race)
+```
+
+---
+
+## 8. Export Results
+
+```{r export}
+# Write all output tables to Excel for use in the client report
+write_xlsx(
+  list(
+    "All Demos by State"      = alldemos,
+    "Dist of Opinion Overall" = freq_table,
+    "Dist of Opinion State"   = state_freq_table
+  ),
+  here::here("outputs", "policy_a_analysis_results.xlsx")
+)
+
+cat("Results exported to outputs/policy_a_analysis_results.xlsx\n")
+```
