@@ -1,4 +1,4 @@
-# 📊 Baseline Political Opinion Survey — Analysis Pipeline
+# 📊 14 State Voter Sentiment Analysis
 
 **Author:** Nandni Talreja  
 **Role:** Data Analyst  
